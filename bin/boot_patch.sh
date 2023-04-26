@@ -6,6 +6,8 @@ BOOTIMAGE="$1"
 [ -z $KEEPFORCEENCRYPT ] && KEEPFORCEENCRYPT=false
 [ -z $PATCHVBMETAFLAG ] && PATCHVBMETAFLAG=false
 [ -z $RECOVERYMODE ] && RECOVERYMODE=false
+[ -z $SYSTEM_ROOT ] && SYSTEM_ROOT=false
+[ -z $ISENCRYPTED ] && ISENCRYPTED=false
 export KEEPVERITY
 export KEEPFORCEENCRYPT
 export PATCHVBMETAFLAG
@@ -16,19 +18,19 @@ export PATCHVBMETAFLAG
 
 CHROMEOS=false
 
-echo "解包boot"
+echo "Unpacking boot image"
 $Magiskboot unpack "$BOOTIMAGE"
 
 case $? in
   0 ) ;;
   1 )
-    echo "不支持的boot镜像!"
+    echo "Unsupported/Unknown image format"
     ;;
   2 )
-    echo "chromeos 镜像"
+    echo "ChromeOS boot image detected"
     ;;
   * )
-    echo "无法解包"
+    echo "Unable to unpack boot image"
     ;;
 esac
 
@@ -37,12 +39,12 @@ esac
 ###################
 
 # Test patch status and do restore
-echo "检查ramdisk"
+echo "Checking ramdisk status"
 if [ -e ramdisk.cpio ]; then
   $Magiskboot cpio ramdisk.cpio test
   STATUS=$?
 else
-  # Stock A only system-as-root
+  # Stock A only legacy SAR, or some Android 13 GKIs
   STATUS=0
 fi
 case $((STATUS & 3)) in
@@ -76,20 +78,22 @@ fi
 # Ramdisk Patches
 ##################
 
-echo "修补ramdisk"
+echo "- Patching ramdisk"
 
-echo "KEEPVERITY=$KEEPVERITY" > config
+echo -n "RANDOMSEED=" > config
+# https://github.com/topjohnwu/Magisk/pull/6340#issuecomment-1287594661
+tr -dc A-Za-z0-9 </dev/urandom | head -c 8 >> config
+echo -ne "\n" >> config
+echo "KEEPVERITY=$KEEPVERITY" >> config
 echo "KEEPFORCEENCRYPT=$KEEPFORCEENCRYPT" >> config
 echo "PATCHVBMETAFLAG=$PATCHVBMETAFLAG" >> config
 echo "RECOVERYMODE=$RECOVERYMODE" >> config
 [ ! -z $SHA1 ] && echo "SHA1=$SHA1" >> config
 
 # Compress to save precious ramdisk space
-
 $Magiskboot compress=xz bin/magisk32 magisk32.xz
- 
 $Magiskboot compress=xz bin/magisk64 magisk64.xz
-
+$Magiskboot compress=xz bin/stub.apk stub.xz
 
 $Magiskboot cpio ramdisk.cpio \
 "add 0750 $INIT bin/magiskinit" \
@@ -97,12 +101,13 @@ $Magiskboot cpio ramdisk.cpio \
 "mkdir 0750 overlay.d/sbin" \
 "add 0644 overlay.d/sbin/magisk32.xz magisk32.xz" \
 "add 0644 overlay.d/sbin/magisk64.xz magisk64.xz" \
+"add 0644 overlay.d/sbin/stub.xz stub.xz" \
 "patch" \
 "backup ramdisk.cpio.orig" \
 "mkdir 000 .backup" \
 "add 000 .backup/.magisk config"
 
-rm -rf ramdisk.cpio.orig config magisk*.xz
+rm -rf ramdisk.cpio.orig config magisk*.xz stub.xz stub.apk
 
 #################
 # Binary Patches
@@ -113,21 +118,28 @@ for dt in dtb kernel_dtb extra; do
 done
 
 if [ -f kernel ]; then
+  PATCHEDKERNEL=false
   # Remove Samsung RKP
   $Magiskboot hexpatch kernel \
   49010054011440B93FA00F71E9000054010840B93FA00F7189000054001840B91FA00F7188010054 \
-  A1020054011440B93FA00F7140020054010840B93FA00F71E0010054001840B91FA00F7181010054
+  A1020054011440B93FA00F7140020054010840B93FA00F71E0010054001840B91FA00F7181010054 \
+  && PATCHEDKERNEL=true
 
   # Remove Samsung defex
   # Before: [mov w2, #-221]   (-__NR_execve)
   # After:  [mov w2, #-32768]
-  $Magiskboot hexpatch kernel 821B8012 E2FF8F12
+  $Magiskboot hexpatch kernel 821B8012 E2FF8F12 && PATCHEDKERNEL=true
 
-  # Force kernel to load rootfs
+  # Force kernel to load rootfs for legacy SAR devices
   # skip_initramfs -> want_initramfs
-  $Magiskboot hexpatch kernel \
+  $SYSTEM_ROOT && $Magiskboot hexpatch kernel \
   736B69705F696E697472616D667300 \
-  77616E745F696E697472616D667300
+  77616E745F696E697472616D667300 \
+  && PATCHEDKERNEL=true
+
+  # If the kernel doesn't need to be patched at all,
+  # keep raw kernel to avoid bootloops on some weird devices
+  $PATCHEDKERNEL || rm -f kernel
 fi
 
 #################
